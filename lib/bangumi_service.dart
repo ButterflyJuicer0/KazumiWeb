@@ -3,7 +3,10 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:kazumi_web/logger.dart';
+import 'package:kazumi_web/services/network/proxy_utils.dart';
 import 'package:kazumi_web/services/storage/storage.dart';
+import 'package:kazumi_web/utils/bangumi_mirror_credentials.dart';
+import 'package:kazumi_web/utils/crypto.dart';
 
 /// Bangumi 公开数据服务：sidecar 直连 bgm.tv（或 Kazumi 镜像后端），
 /// 不经过宿主 Host API——这些不是宿主独有能力。
@@ -18,6 +21,23 @@ class BangumiService {
     // 与 network_config 同理：缩短 keep-alive 空闲期，避免复用被
     // 对端半关闭的死连接（表现为间歇性 HandshakeException）。
     _client.idleTimeout = const Duration(seconds: 3);
+    // 与 VideoProxyHandler 一致：findProxy 每次建连时读设置，web 端切换
+    // proxyEnable 立即生效。此前 Bangumi 请求完全不走代理，api.bgm.tv
+    // 被阻断的网络下开了代理也无法检索。
+    _client.findProxy = (_) => _proxyDirective();
+  }
+
+  static String _proxyDirective() {
+    try {
+      final bool enable = GStorage.getSetting(SettingsKeys.proxyEnable);
+      if (!enable) return 'DIRECT';
+      final parsed =
+          ProxyUtils.parseProxyUrl(GStorage.getSetting(SettingsKeys.proxyUrl));
+      if (parsed == null) return 'DIRECT';
+      return 'PROXY ${parsed.$1}:${parsed.$2}';
+    } catch (_) {
+      return 'DIRECT';
+    }
   }
 
   /// 每次请求时读取设置，web 端切换镜像开关后即时生效，无需重启服务。
@@ -27,12 +47,16 @@ class BangumiService {
   final Random _random = Random();
 
   static const _mirrorDomain = 'https://api.kazumi.fyi';
+  // Bangumi 鉴权 API 镜像（上游 ApiEndpoints.bangumiAuthAPIMirrorDomain），
+  // 中继 api.bgm.tv 的 /v0 端点且不要求签名。kazumi.fyi 拒绝未签名的
+  // 受保护请求（无 KAZUMI_APPID/KEY 的构建必然如此）时作为第二镜像。
+  static const _authMirrorDomain = 'https://api.bgmapi.com';
   static const _userAgent =
       'KazumiWeb/0.1.0 (https://github.com/Predidit/Kazumi)';
 
   // 高层端点始终以官方域构造 URL；镜像替换与失败回退在请求层统一处理
-  // （见 _requestJson）。镜像后端只中继部分端点（如 /p1/subjects），对
-  // 未支持的端点（如 /v0/search）返回 401，此时回退官方直连。
+  // （见 _requestJson）。kazumi.fyi 对未签名的受保护端点（如 /v0/search）
+  // 返回 401，此时依次回退 api.bgmapi.com（仅 /v0）与官方直连。
   String get _v0Base => 'https://api.bgm.tv';
   String get _nextBase => 'https://next.bgm.tv';
 
@@ -542,10 +566,19 @@ class BangumiService {
       final mirrored = _mirrorize(url);
       if (mirrored != url) {
         try {
-          return await _rawRequest(method, mirrored, body);
+          return await _rawRequest(method, mirrored, body,
+              headers: _mirrorSignatureHeaders(method, url, body));
+        } catch (e) {
+          logWarn('BangumiService: mirror failed for $mirrored', e);
+        }
+      }
+      final authMirrored = _authMirrorize(url);
+      if (authMirrored != url) {
+        try {
+          return await _rawRequest(method, authMirrored, body);
         } catch (e) {
           logWarn(
-              'BangumiService: mirror failed for $mirrored, falling back to official',
+              'BangumiService: auth mirror failed for $authMirrored, falling back to official',
               e);
         }
       }
@@ -563,10 +596,50 @@ class BangumiService {
     return url;
   }
 
+  /// api.bgmapi.com 只中继 api.bgm.tv（/v0），不含 next.bgm.tv（/p1）。
+  String _authMirrorize(String url) {
+    final uri = Uri.parse(url);
+    if (uri.host == 'api.bgm.tv') {
+      return uri.replace(host: Uri.parse(_authMirrorDomain).host).toString();
+    }
+    return url;
+  }
+
+  /// 对齐上游 BangumiClient._shouldSignProtectedMirrorRequest：kazumi.fyi
+  /// 的检索与评论端点要求 X-AppId / X-Timestamp / X-Signature。凭证由 CI
+  /// 经 --dart-define 注入，缺省（自行构建）时不签名，交给第二镜像兜底。
+  /// [url] 为替换前的官方 URL，签名用的 path 与镜像一致。
+  Map<String, String> _mirrorSignatureHeaders(
+      String method, String url, String? body) {
+    final appId = bangumiMirrorCredentials['id'] ?? '';
+    final appKey = bangumiMirrorCredentials['value'] ?? '';
+    if (appId.isEmpty || appKey.isEmpty) return const {};
+    final path = Uri.parse(url).path;
+    final protected = (method == 'POST' && path == '/v0/search/subjects') ||
+        (method == 'GET' &&
+            (path.startsWith('/p1/subjects/') ||
+                path.startsWith('/p1/episodes/') ||
+                path.startsWith('/p1/characters/')) &&
+            path.endsWith('/comments'));
+    if (!protected) return const {};
+    final timestamp = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    return {
+      'X-AppId': appId,
+      'X-Timestamp': '$timestamp',
+      'X-Signature': generateBangumiMirrorSearchSignature(
+        method: method,
+        path: path,
+        body: body ?? '',
+        timestamp: timestamp,
+      ),
+    };
+  }
+
   /// 瞬时连接层错误（TLS 握手被 RST、socket 中断）在实测中重试成功率
   /// 极高（网络对镜像域的直连质量存在间歇抖动），就地快速重试两次；
   /// HTTP 状态码错误是确定性结果，不重试。
-  Future<dynamic> _rawRequest(String method, String url, String? body) async {
+  Future<dynamic> _rawRequest(String method, String url, String? body,
+      {Map<String, String> headers = const {}}) async {
     Object? lastError;
     for (var attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) {
@@ -574,7 +647,7 @@ class BangumiService {
         await Future.delayed(Duration(milliseconds: 400 * attempt));
       }
       try {
-        return await _rawRequestOnce(method, url, body);
+        return await _rawRequestOnce(method, url, body, headers);
       } on HandshakeException catch (e) {
         lastError = e;
       } on SocketException catch (e) {
@@ -588,11 +661,12 @@ class BangumiService {
     throw lastError!;
   }
 
-  Future<dynamic> _rawRequestOnce(
-      String method, String url, String? body) async {
+  Future<dynamic> _rawRequestOnce(String method, String url, String? body,
+      Map<String, String> headers) async {
     final request = await _client.openUrl(method, Uri.parse(url));
     request.headers.set(HttpHeaders.userAgentHeader, _userAgent);
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    headers.forEach((name, value) => request.headers.set(name, value));
     if (body != null) {
       request.headers.contentType =
           ContentType('application', 'json', charset: 'utf-8');
