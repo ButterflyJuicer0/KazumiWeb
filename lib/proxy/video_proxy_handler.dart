@@ -146,6 +146,12 @@ class VideoProxyHandler {
           upstreamRequest.headers.set('range', range);
         }
         upstreamRequest.headers.set('accept', '*/*');
+        // autoUncompress=false 时 dart:io 仍默认发 accept-encoding: gzip，
+        // 上游（如 hhplayer.com 的 m3u8）就回 gzip 体：m3u8 被当成文本
+        // 解析成乱码，流式路径又丢掉了 content-encoding 头。透明代理
+        // 只要原始字节，明确要求不压缩。
+        upstreamRequest.headers
+            .set(HttpHeaders.acceptEncodingHeader, 'identity');
 
         upstreamRequest.followRedirects = true;
         upstreamRequest.maxRedirects = 5;
@@ -186,7 +192,10 @@ class VideoProxyHandler {
     required Uri targetUri,
     required String token,
   }) async {
-    final bodyBytes = await _readAll(upstreamResponse);
+    final bodyBytes = decodeContentEncoding(
+      await _readAll(upstreamResponse),
+      upstreamResponse.headers.value(HttpHeaders.contentEncodingHeader),
+    );
     final bodyText = utf8.decode(bodyBytes, allowMalformed: true);
 
     // Media playlist 走"解析 + 广告过滤 + 重写"路径，浏览器拿到的是 clean m3u8。
@@ -373,6 +382,21 @@ class VideoProxyHandler {
       if (c < 0x20 || c > 0x7E) return false;
     }
     return true;
+  }
+
+  /// 兜底：即便请求了 identity，仍有上游无视并回 gzip/deflate。按
+  /// content-encoding 解压；头缺失但字节是 gzip 魔数（1f 8b）时同样解压。
+  /// 解压失败原样返回，交给后续解析降级。
+  static List<int> decodeContentEncoding(List<int> bytes, String? encoding) {
+    final enc = (encoding ?? '').toLowerCase();
+    final looksGzip = bytes.length >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b;
+    try {
+      if (enc.contains('gzip') || looksGzip) return gzip.decode(bytes);
+      if (enc.contains('deflate')) return zlib.decode(bytes);
+    } catch (e) {
+      logWarn('VideoProxyHandler: failed to decode "$enc" body, using raw', e);
+    }
+    return bytes;
   }
 
   Future<Uint8List> _readAll(HttpClientResponse response) async {
