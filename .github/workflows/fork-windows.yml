@@ -1,0 +1,51 @@
+# Fork-only: build and publish just the Windows package for this fork.
+# The upstream releases.yml also pushes a Docker image to ghcr.io/0chencc,
+# which forks cannot do. Push a fork-v* tag to run it:
+#   git tag fork-v0.2.0-fix.1 && git push origin fork-v0.2.0-fix.1
+name: Fork Windows Release
+
+on:
+  push:
+    tags:
+      - 'fork-v*'
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: 3.44.0
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test --exclude-tags network
+      - run: flutter build windows --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "KazumiWeb"
+          Copy-Item build/windows/x64/runner/Release $out -Recurse
+          Copy-Item web "$out/web" -Recurse
+          $zip = "KazumiWeb-$env:GITHUB_REF_NAME-windows-x64.zip"
+          Compress-Archive -Path $out -DestinationPath $zip
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() + "  " + $zip | Out-File -Encoding ascii "$zip.sha256"
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" KazumiWeb-*.zip KazumiWeb-*.zip.sha256 \
+            --title "$GITHUB_REF_NAME" --prerelease --verify-tag \
+            --notes "Fork build: Bangumi search mirror fallback + proxy support, m3u8 gzip fix. Built from ${GITHUB_SHA}."
